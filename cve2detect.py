@@ -170,6 +170,20 @@ def exploited_status(rec):
     return "no public exploit found in references"
 
 
+def fetch_nuclei_template(cve):
+    """Pull the real community detection from projectdiscovery/nuclei-templates, if one exists.
+    These are working, vetted checks keyed by CVE id, so we ship the real thing instead of a skeleton."""
+    year = cve.split("-")[1]
+    base = "https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main"
+    for path in (f"http/cves/{year}/{cve}.yaml", f"cves/{year}/{cve}.yaml"):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{base}/{path}", headers=UA), timeout=15) as r:
+                return r.read().decode(), path
+        except Exception:
+            continue
+    return None, None
+
+
 # ---------- generators ----------
 
 def triage(rec):
@@ -184,6 +198,8 @@ def triage(rec):
         lines.append(f"    - KEV added {rec['kev']['added']}, remediate by {rec['kev']['due']}")
         if rec["kev"].get("action"):
             lines.append(f"    - required action: {rec['kev']['action']}")
+    if rec.get("nuclei_template"):
+        lines.append(f"- **Nuclei check:** real community template available ({rec['nuclei_template']})")
     if rec["cwes"]:
         labels = [f"{c} ({CWE_HINTS[c][0]})" if c in CWE_HINTS else c for c in rec["cwes"]]
         lines.append(f"- **Class:** {', '.join(labels)}")
@@ -346,10 +362,12 @@ def main():
     if not re.match(r"CVE-\d{4}-\d+$", cve):
         sys.exit("error: expected a CVE id like CVE-2021-44228")
 
-    print(f"fetching + enriching {cve} (OSV, NVD, EPSS, KEV) ...")
+    print(f"fetching + enriching {cve} (OSV, NVD, EPSS, KEV, nuclei-templates) ...")
     rec = fetch(cve)
     if not rec:
         sys.exit(f"error: {cve} not found in OSV or NVD")
+    nuclei_real, nuclei_path = fetch_nuclei_template(cve)
+    rec["nuclei_template"] = nuclei_path
 
     # print the triage banner to the terminal (the headline)
     print("\n" + triage(rec).replace("# ", "").replace("**", "").strip() + "\n")
@@ -366,13 +384,16 @@ def main():
                 f.write(f"- `{a['ecosystem']}:{a['name']}` introduced {intro}, fixed in {a['fixed'] or 'see advisory'}\n")
         else:
             f.write("- (no package-level data; likely an OS/appliance CVE)\n")
-        f.write("\n## Generated\n- sigma.yml, nuclei.yaml, version-checks.sh"
+        f.write("\n## Generated\n- sigma.yml (seeded), "
+                + ("nuclei.yaml (REAL community detection from nuclei-templates: " + nuclei_path + ")" if nuclei_path
+                   else "nuclei.yaml (skeleton; no community template exists)")
+                + ", version-checks.sh"
                 + (", semgrep.yml" if code_cwe(rec) else "")
                 + (", repro/" if (rec["affected"] and rec["affected"][0]["ecosystem"] in REPRO) else "") + "\n")
     with open(os.path.join(outdir, "sigma.yml"), "w") as f:
         f.write(gen_sigma(rec))
     with open(os.path.join(outdir, "nuclei.yaml"), "w") as f:
-        f.write(gen_nuclei(rec))
+        f.write(nuclei_real if nuclei_real else gen_nuclei(rec))
     sg = gen_semgrep(rec)
     if sg:
         with open(os.path.join(outdir, "semgrep.yml"), "w") as f:

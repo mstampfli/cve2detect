@@ -21,7 +21,9 @@ python3 cve2detect.py CVE-2021-23337 --ai
 Into `cve2detect-out/<CVE>/`:
 - **`sigma.yml`** - a Sigma detection-rule skeleton seeded with the title, references, CWE
   tags, and a severity-mapped level. You fill in the log source and indicators.
-- **`nuclei.yaml`** - a Nuclei web-check template skeleton (for web/exploit-style CVEs).
+- **`nuclei.yaml`** - the **real, community-maintained Nuclei detection** pulled from
+  projectdiscovery/nuclei-templates when one exists (a working `nuclei -t nuclei.yaml -u <host>`
+  check, not a skeleton); falls back to a seeded skeleton only when no template is published.
 - **`version-checks.sh`** - per-ecosystem commands to find the vulnerable package in a
   project (npm/pip/cargo/go/maven/...), with the fixed version noted.
 - **`repro/`** - a minimal scaffold pinned to a vulnerable version (npm / PyPI / crates.io),
