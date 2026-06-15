@@ -67,5 +67,4 @@ Python 3 (stdlib only). Network access for OSV + NVD. The `claude` CLI is option
 
 ## Roadmap
 - richer code-pattern rules (Semgrep) when the CWE/PoC implies a code signature
-- KEV (known-exploited) enrichment and EPSS scoring
-- pull a real PoC from the references to auto-fill the Nuclei matcher
+- derive a Nuclei matcher from a referenced PoC when no community template exists
