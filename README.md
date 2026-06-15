@@ -40,11 +40,22 @@ GHSA / PYSEC / RUSTSEC aliases to get the real ecosystem packages and version ra
 pulls CVSS + CWE from NVD. Example: `CVE-2021-44228` resolves to
 `Maven:org.apache.logging.log4j:log4j-core`, introduced 2.13.0, fixed 2.15.0.
 
-## The `--ai` flag
-The deterministic core above needs no LLM. With `--ai`, it pipes the structured CVE data to
-the `claude` CLI (`claude -p`) and writes `ai-draft.md` with a fuller, concrete detection
-idea and a repro outline. No API key required; it uses your Claude Code login. If `claude`
-isn't installed, it just skips that step.
+## The `--ai` flag (pluggable backends)
+The deterministic core above needs no LLM. With `--ai`, cve2detect drafts a concrete
+detection + repro into `ai-draft.md` using a backend of your choice:
+
+```sh
+python3 cve2detect.py CVE-2021-44228 --ai                                            # claude CLI (default, no key)
+python3 cve2detect.py CVE-2021-44228 --ai --ai-backend ollama --ai-model qwen2.5:3b  # local model, no key
+OPENAI_API_KEY=... python3 cve2detect.py CVE-2021-44228 --ai --ai-backend openai --ai-model gpt-4o
+```
+
+- **claude** (default) - the Claude Code CLI (`claude -p`), no API key.
+- **ollama** - a local model (default `--ai-url http://localhost:11434`), no key, fully offline.
+- **openai** - any OpenAI-compatible API (OpenAI, OpenRouter, Groq, a local llama.cpp server, ...);
+  set `--ai-url` and `OPENAI_API_KEY` (or `AI_API_KEY`).
+
+`--ai-model` and `--ai-url` override the per-backend defaults; missing key/server is skipped with a clear message.
 
 ## Honest scope
 The generated rules are **seeded skeletons, not finished detections** - they give you the

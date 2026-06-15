@@ -390,32 +390,88 @@ def gen_repro(rec, outdir):
     return rd
 
 
-def run_ai(rec, outdir):
+# ---- AI drafting: pluggable backends (claude CLI / local Ollama / OpenAI-compatible API) ----
+
+AI_DEFAULTS = {
+    "claude": {"model": None, "url": None},
+    "ollama": {"model": "llama3.1", "url": "http://localhost:11434"},
+    "openai": {"model": "gpt-4o-mini", "url": "https://api.openai.com/v1"},
+}
+
+
+def ai_prompt(rec):
+    return ("You are a detection engineer. Given this enriched CVE, write: (1) a concrete detection with the "
+            "best data source and the exact indicators to match (derive from the CWE class, the Nuclei template "
+            "if present, and the exploit references), and (2) a minimal repro outline. Be concrete and terse.\n\n"
+            + json.dumps(rec, indent=2))
+
+
+def ai_claude(prompt, model, url):
+    """Anthropic via the Claude Code CLI (no API key; uses the local subscription login)."""
     if not shutil.which("claude"):
-        print("  --ai: `claude` CLI not found, skipping")
-        return
-    prompt = ("You are a detection engineer. Given this enriched CVE, write: (1) a concrete detection "
-              "with the best data source and the exact indicators to match (derive from the CWE class and "
-              "exploit references), and (2) a minimal repro outline. Be concrete and terse.\n\n"
-              + json.dumps(rec, indent=2))
+        return None, "`claude` CLI not found"
+    args = ["claude", "-p", "--output-format", "text"] + (["--model", model] if model else [])
     try:
-        r = subprocess.run(["claude", "-p", "--output-format", "text"], input=prompt,
-                           capture_output=True, text=True, timeout=180)
+        r = subprocess.run(args, input=prompt, capture_output=True, text=True, timeout=300)
         if r.returncode == 0 and r.stdout.strip():
-            with open(os.path.join(outdir, "ai-draft.md"), "w") as f:
-                f.write(f"# AI detection + repro draft for {rec['id']}\n\n{r.stdout}\n")
-            print("  --ai: wrote ai-draft.md")
-        else:
-            print(f"  --ai: no output ({r.stderr.strip()[:80]})")
+            return r.stdout, None
+        return None, (r.stderr.strip()[:120] or "no output")
     except Exception as e:
-        print(f"  --ai: skipped ({e})")
+        return None, str(e)
+
+
+def ai_ollama(prompt, model, url):
+    """A local model served by Ollama (no API key)."""
+    body = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
+    try:
+        req = urllib.request.Request(f"{url}/api/generate", data=body,
+                                     headers={**UA, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r).get("response", ""), None
+    except Exception as e:
+        return None, f"{e} (is ollama running at {url} and '{model}' pulled?)"
+
+
+def ai_openai(prompt, model, url):
+    """Any OpenAI-compatible chat API (OpenAI, OpenRouter, Groq, llama.cpp, ...). Key from $OPENAI_API_KEY / $AI_API_KEY."""
+    key = os.environ.get("OPENAI_API_KEY") or os.environ.get("AI_API_KEY")
+    if not key:
+        return None, "set OPENAI_API_KEY (or AI_API_KEY) for the openai backend"
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode()
+    try:
+        req = urllib.request.Request(f"{url}/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)["choices"][0]["message"]["content"], None
+    except Exception as e:
+        return None, str(e)
+
+
+AI_BACKENDS = {"claude": ai_claude, "ollama": ai_ollama, "openai": ai_openai}
+
+
+def run_ai(rec, outdir, backend, model, url):
+    model = model or AI_DEFAULTS[backend]["model"]
+    url = url or AI_DEFAULTS[backend]["url"]
+    label = backend + (f"/{model}" if model else "")
+    text, err = AI_BACKENDS[backend](ai_prompt(rec), model, url)
+    if text:
+        with open(os.path.join(outdir, "ai-draft.md"), "w") as f:
+            f.write(f"# AI detection + repro draft for {rec['id']}\n_backend: {label}_\n\n{text}\n")
+        print(f"  --ai ({label}): wrote ai-draft.md")
+    else:
+        print(f"  --ai ({backend}): skipped ({err})")
 
 
 def main():
     ap = argparse.ArgumentParser(description="triage a CVE and bootstrap detection + repro")
     ap.add_argument("cve")
     ap.add_argument("--out", default="cve2detect-out")
-    ap.add_argument("--ai", action="store_true", help="draft fuller artifacts via the claude CLI")
+    ap.add_argument("--ai", action="store_true", help="draft a detection + repro with an LLM")
+    ap.add_argument("--ai-backend", choices=["claude", "ollama", "openai"], default="claude",
+                    help="LLM backend: claude (CLI, default, no key), ollama (local model), openai (OpenAI-compatible API)")
+    ap.add_argument("--ai-model", help="model name (backend default if unset)")
+    ap.add_argument("--ai-url", help="base URL (ollama: http://localhost:11434; openai: https://api.openai.com/v1)")
     args = ap.parse_args()
     cve = args.cve.upper()
     if not re.match(r"CVE-\d{4}-\d+$", cve):
@@ -468,7 +524,7 @@ def main():
             f.write("#!/usr/bin/env bash\n# " + cve + "\n\n" + "\n\n".join(checks) + "\n")
     gen_repro(rec, outdir)
     if args.ai:
-        run_ai(rec, outdir)
+        run_ai(rec, outdir, args.ai_backend, args.ai_model, args.ai_url)
 
     print(f"wrote artifacts to {outdir}/")
     for n in sorted(os.listdir(outdir)):
