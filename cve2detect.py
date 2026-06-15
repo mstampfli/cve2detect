@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-cve2detect - turn a CVE into a detection rule and a repro scaffold.
+cve2detect - triage a CVE and bootstrap detection + reproduction.
 
-Give it a CVE id. It pulls the structured advisory (OSV + NVD), then writes:
-  - a Sigma detection-rule skeleton seeded with the real metadata
-  - a Nuclei template skeleton (for web/exploit-ish CVEs)
-  - per-ecosystem version-check commands for the affected packages
-  - a minimal repro scaffold pinned to a vulnerable version
-  - a summary.md
+Give it a CVE id. It pulls the advisory from OSV + NVD and enriches it with the
+data a defender actually triages on:
 
-Deterministic core works offline of any LLM. `--ai` drafts fuller rule + repro
-text via the `claude` CLI (no API key needed).
+  - KEV       : is it on CISA's Known Exploited Vulnerabilities list (in-the-wild)?
+  - EPSS      : FIRST's probability that it will be exploited in the next 30 days
+  - exploit?  : is there a public exploit (NVD reference tags + known exploit hosts)
+  - CVSS/CWE  : severity and vulnerability class
+
+Then it writes artifacts seeded with that real data:
+  - summary.md       : the triage, up top, so you know if you even care
+  - sigma.yml        : detection rule, seeded from the CWE class + references
+  - semgrep.yml      : a code-pattern rule for code-level CWEs (sqli, xss, rce, ...)
+  - nuclei.yaml      : web-check template (for remote/web CVEs)
+  - version-checks.sh: per-ecosystem "is the vulnerable package here?" commands
+  - repro/           : a scaffold pinned to a vulnerable version
+
+`--ai` drafts a concrete detection + repro from the whole enriched context via the
+`claude` CLI (no API key).
 
     python3 cve2detect.py CVE-2021-44228
-    python3 cve2detect.py CVE-2024-3094 --ai
+    python3 cve2detect.py CVE-2021-23337 --ai
 """
 
 import argparse
@@ -24,35 +33,61 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import urllib.parse
 import urllib.request
 
-UA = {"User-Agent": "cve2detect/0.1"}
+UA = {"User-Agent": "cve2detect/0.2"}
+EXPLOIT_HOSTS = ("exploit-db.com", "github.com", "packetstormsecurity", "metasploit",
+                 "rapid7.com/db", "nuclei-templates", "0day.today", "seclists.org/fulldisclosure")
+
+# CWE class -> (human label, is_code_pattern, what a detection should look for)
+CWE_HINTS = {
+    "CWE-79": ("Cross-site scripting", True, "untrusted input reflected into HTML/JS output without encoding"),
+    "CWE-89": ("SQL injection", True, "untrusted input concatenated into a SQL query"),
+    "CWE-78": ("OS command injection", True, "untrusted input passed to a shell/exec call"),
+    "CWE-77": ("Command injection", True, "untrusted input in a command string"),
+    "CWE-94": ("Code injection", True, "untrusted input reaching eval/compile/template render"),
+    "CWE-95": ("Eval injection", True, "untrusted input reaching eval()"),
+    "CWE-502": ("Deserialization of untrusted data", True, "untrusted bytes passed to a deserializer (pickle/yaml.load/ObjectInputStream)"),
+    "CWE-22": ("Path traversal", True, "untrusted input used in a filesystem path without normalization"),
+    "CWE-23": ("Path traversal", True, "untrusted input used in a filesystem path"),
+    "CWE-918": ("SSRF", True, "untrusted input used as a request URL/host"),
+    "CWE-611": ("XML external entity (XXE)", True, "XML parsed with external entities enabled"),
+    "CWE-1321": ("Prototype pollution", True, "recursive merge/assign with attacker-controlled keys"),
+    "CWE-434": ("Unrestricted file upload", True, "uploaded file written/executed without type checks"),
+    "CWE-352": ("CSRF", False, "state-changing request without anti-CSRF token validation"),
+    "CWE-287": ("Improper authentication", False, "auth check bypassable"),
+    "CWE-306": ("Missing authentication", False, "sensitive function reachable without auth"),
+    "CWE-862": ("Missing authorization", False, "action performed without authorization check"),
+    "CWE-863": ("Incorrect authorization", False, "authorization decision is wrong"),
+    "CWE-400": ("Uncontrolled resource consumption (DoS)", False, "input that triggers unbounded work/memory"),
+    "CWE-20": ("Improper input validation", False, "input not validated before use"),
+}
+
+SEMGREP_LANG = {"PyPI": "python", "npm": "javascript", "Maven": "java", "Go": "go",
+                "RubyGems": "ruby", "Packagist": "php", "crates.io": "generic"}
 
 
-def get_json(url):
+def get_json(url, timeout=20):
     try:
-        req = urllib.request.Request(url, headers=UA)
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
             return json.load(r)
     except Exception:
         return None
 
 
-# ---------- fetch + normalize ----------
+# ---------- fetch + enrich ----------
 
 def fetch(cve):
+    rec = {"id": cve, "summary": "", "cvss": None, "severity": "unknown", "cwes": [],
+           "affected": [], "references": [], "exploit_refs": [],
+           "kev": None, "epss": None}
+
+    # OSV: package data (follow GHSA/etc. aliases; CVE record only has git ranges)
     osv = get_json(f"https://api.osv.dev/v1/vulns/{cve}")
-    nvd = get_json(f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}")
-
-    rec = {"id": cve, "summary": "", "details": "", "cvss": None, "severity": "unknown",
-           "cwes": [], "affected": [], "references": []}
-
-    # OSV CVE-level records often carry only GIT ranges with package=None; the
-    # real ecosystem package + version ranges live in the GHSA/PYSEC/etc. aliases.
     records = []
     if osv:
-        rec["summary"] = osv.get("summary", "")
-        rec["details"] = osv.get("details", "")
+        rec["summary"] = osv.get("summary", "") or osv.get("details", "")[:300]
         rec["references"] = [r.get("url", "") for r in osv.get("references", [])]
         records.append(osv)
         for al in osv.get("aliases", []):
@@ -60,11 +95,10 @@ def fetch(cve):
                 sub = get_json(f"https://api.osv.dev/v1/vulns/{al}")
                 if sub:
                     records.append(sub)
-                    if not rec["summary"]:
-                        rec["summary"] = sub.get("summary", "")
-
     seen = set()
     for r in records:
+        if not rec["summary"]:
+            rec["summary"] = r.get("summary", "")
         for a in r.get("affected", []):
             pkg = a.get("package")
             if not pkg:
@@ -72,31 +106,26 @@ def fetch(cve):
             key = (pkg.get("ecosystem"), pkg.get("name"))
             if key in seen:
                 continue
-            introduced, fixed = None, None
+            introduced = fixed = None
             for rng in a.get("ranges", []):
-                if rng.get("type") not in ("ECOSYSTEM", "SEMVER"):  # ignore GIT commit ranges
+                if rng.get("type") not in ("ECOSYSTEM", "SEMVER"):
                     continue
                 for ev in rng.get("events", []):
                     introduced = ev.get("introduced", introduced)
                     fixed = ev.get("fixed", fixed)
             versions = a.get("versions", [])
-            vuln_example = None
-            if versions:
-                below = [v for v in versions if v != fixed]
-                vuln_example = below[-1] if below else None
-            vuln_example = vuln_example or (introduced if introduced not in (None, "0") else None)
+            vuln_example = next((v for v in reversed(versions) if v != fixed), None) or \
+                (introduced if introduced not in (None, "0") else None)
             seen.add(key)
-            rec["affected"].append({
-                "ecosystem": pkg.get("ecosystem", ""), "name": pkg.get("name", ""),
-                "introduced": introduced, "fixed": fixed, "vuln_example": vuln_example,
-            })
+            rec["affected"].append({"ecosystem": pkg.get("ecosystem", ""), "name": pkg.get("name", ""),
+                                    "introduced": introduced, "fixed": fixed, "vuln_example": vuln_example})
 
+    # NVD: cvss, cwe, KEV (cisa* fields), reference tags (-> exploit signal)
+    nvd = get_json(f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve}")
     if nvd and nvd.get("vulnerabilities"):
         c = nvd["vulnerabilities"][0]["cve"]
         if not rec["summary"]:
-            for d in c.get("descriptions", []):
-                if d.get("lang") == "en":
-                    rec["summary"] = d["value"]
+            rec["summary"] = next((d["value"] for d in c.get("descriptions", []) if d.get("lang") == "en"), "")
         for w in c.get("weaknesses", []):
             for d in w.get("description", []):
                 if d["value"].startswith("CWE-"):
@@ -106,55 +135,125 @@ def fetch(cve):
             if key in metrics:
                 data = metrics[key][0]["cvssData"]
                 rec["cvss"] = data.get("baseScore")
-                rec["severity"] = data.get("baseSeverity", "").lower() or rec["severity"]
+                rec["severity"] = (data.get("baseSeverity") or "").lower() or rec["severity"]
                 break
+        if c.get("cisaExploitAdd"):
+            rec["kev"] = {"added": c["cisaExploitAdd"], "due": c.get("cisaActionDue"),
+                          "action": c.get("cisaRequiredAction"), "name": c.get("cisaVulnerabilityName")}
         for r in c.get("references", []):
-            if r.get("url") and r["url"] not in rec["references"]:
-                rec["references"].append(r["url"])
-
+            url = r.get("url", "")
+            if url and url not in rec["references"]:
+                rec["references"].append(url)
+            if "Exploit" in r.get("tags", []):
+                rec["exploit_refs"].append(url)
     rec["cwes"] = sorted(set(rec["cwes"]))
+
+    # references that point at known exploit sources
+    for url in rec["references"]:
+        if any(h in url for h in EXPLOIT_HOSTS) and url not in rec["exploit_refs"]:
+            rec["exploit_refs"].append(url)
+
+    # EPSS
+    epss = get_json(f"https://api.first.org/data/v1/epss?cve={cve}")
+    if epss and epss.get("data"):
+        d = epss["data"][0]
+        rec["epss"] = {"score": float(d["epss"]), "percentile": float(d["percentile"])}
+
     return rec if (osv or nvd) else None
+
+
+def exploited_status(rec):
+    if rec["kev"]:
+        return "ACTIVELY EXPLOITED (on CISA KEV)"
+    if rec["exploit_refs"]:
+        return "public exploit referenced"
+    return "no public exploit found in references"
 
 
 # ---------- generators ----------
 
-SIGMA_LEVEL = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "unknown": "medium"}
+def triage(rec):
+    lines = [f"# {rec['id']}", ""]
+    sev = rec["severity"].upper() if rec["severity"] != "unknown" else "?"
+    lines.append(f"- **Severity:** {sev} (CVSS {rec['cvss']})")
+    if rec["epss"]:
+        lines.append(f"- **EPSS:** {rec['epss']['score']*100:.1f}% exploitation probability "
+                     f"({rec['epss']['percentile']*100:.0f}th percentile of all CVEs)")
+    lines.append(f"- **Exploitation:** {exploited_status(rec)}")
+    if rec["kev"]:
+        lines.append(f"    - KEV added {rec['kev']['added']}, remediate by {rec['kev']['due']}")
+        if rec["kev"].get("action"):
+            lines.append(f"    - required action: {rec['kev']['action']}")
+    if rec["cwes"]:
+        labels = [f"{c} ({CWE_HINTS[c][0]})" if c in CWE_HINTS else c for c in rec["cwes"]]
+        lines.append(f"- **Class:** {', '.join(labels)}")
+    if rec["exploit_refs"]:
+        lines.append("- **Exploit references:**")
+        lines += [f"    - {u}" for u in rec["exploit_refs"][:4]]
+    return "\n".join(lines)
 
-VERCHECK = {
-    "PyPI": lambda p, v: f"pip show {p}            # vulnerable if version is {v or '< fixed'}",
-    "npm": lambda p, v: f"npm ls {p}               # flags any tree using {p} {v or ''}",
-    "crates.io": lambda p, v: f"cargo tree -i {p}  # who pulls in {p} {v or ''}",
-    "Go": lambda p, v: f"govulncheck ./...         # detects {p} usage paths",
-    "Maven": lambda p, v: f"mvn dependency:tree | grep {p}",
-    "RubyGems": lambda p, v: f"bundle list | grep {p}",
-    "Packagist": lambda p, v: f"composer show {p}",
-}
+
+def code_cwe(rec):
+    return next((c for c in rec["cwes"] if c in CWE_HINTS and CWE_HINTS[c][1]), None)
+
+
+def gen_semgrep(rec):
+    cwe = code_cwe(rec)
+    if not cwe:
+        return None
+    label, _, look_for = CWE_HINTS[cwe]
+    lang = "generic"
+    if rec["affected"]:
+        lang = SEMGREP_LANG.get(rec["affected"][0]["ecosystem"], "generic")
+    sev = "ERROR" if rec["severity"] in ("critical", "high") else "WARNING"
+    return textwrap.dedent(f"""\
+        rules:
+          - id: {rec['id'].lower()}-{cwe.lower()}
+            languages: [{lang}]
+            severity: {sev}
+            message: >
+              {rec['id']} ({label}). Look for: {look_for}.
+              {rec['summary'][:140]}
+            metadata:
+              cve: {rec['id']}
+              cwe: {cwe}
+              references:
+{chr(10).join(f"                - {u}" for u in rec['references'][:4]) or "                - <add reference>"}
+            # TODO: narrow to the vulnerable sink in {rec['affected'][0]['name'] if rec['affected'] else 'the affected code'}.
+            # Pattern below is a CWE-class starting point for: {look_for}
+            patterns:
+              - pattern-either:
+                  - pattern: $SINK(..., $UNTRUSTED, ...)
+              # refine $SINK to the dangerous API and $UNTRUSTED to the tainted source
+        """)
 
 
 def gen_sigma(rec):
     refs = "\n".join(f"        - {u}" for u in rec["references"][:5]) or "        - <add reference>"
+    level = rec["severity"] if rec["severity"] in ("critical", "high", "medium", "low") else "medium"
+    cwe = code_cwe(rec) or (rec["cwes"][0] if rec["cwes"] else None)
+    hint = CWE_HINTS.get(cwe, (None, None, "the exploited behavior"))[2] if cwe else "the exploited behavior"
+    kev_note = "  (ON CISA KEV - actively exploited, prioritize)" if rec["kev"] else ""
     return textwrap.dedent(f"""\
-        title: {rec['id']} - {(rec['summary'] or 'detection')[:70]}
+        title: {rec['id']} - {(rec['summary'] or 'detection')[:66]}
         id: {rec['id'].lower()}-detect
         status: experimental
         description: |
-            Detection skeleton for {rec['id']}. {rec['summary'][:160]}
-            TODO: replace the selection below with concrete indicators
-            (process, network, file, or log fields) for your data source.
+            Detection for {rec['id']}.{kev_note}
+            Hunt for: {hint}.
         references:
 {refs}
         tags:
             - {rec['id'].lower()}
-""" + "".join(f"            - cwe.{c.split('-')[1]}\n" for c in rec["cwes"]) + textwrap.dedent(f"""\
+""" + "".join(f"            - cve.{rec['id'][4:]}\n" for _ in [0]) + textwrap.dedent(f"""\
         logsource:
-            category: TODO      # e.g. process_creation | webserver | dns | network_connection
-            product: TODO
+            category: TODO      # process_creation | webserver | dns | network_connection
         detection:
             selection:
                 TODO_field|contains:
-                    - 'TODO_indicator'   # e.g. exploit string, user-agent, path, package name
+                    - 'TODO_indicator'   # derive from the exploit reference above
             condition: selection
-        level: {SIGMA_LEVEL.get(rec['severity'], 'medium')}
+        level: {level}
         """))
 
 
@@ -163,49 +262,39 @@ def gen_nuclei(rec):
     sev = rec["severity"] if rec["severity"] != "unknown" else "medium"
     return textwrap.dedent(f"""\
         id: {rec['id'].lower()}
-
         info:
           name: {rec['id']} - {(rec['summary'] or 'check')[:60]}
           author: mstampfli
           severity: {sev}
-          description: |
-            {rec['summary'][:200]}
           reference:
 {refs}
           classification:
             cve-id: {rec['id']}
-          tags: cve,{rec['id'].lower().replace('cve-', 'cve')}
-
-        # TODO: this is a skeleton. Fill in the request + matcher from the PoC
-        # in the references above.
+          tags: cve
+        # TODO: fill the request + matcher from the PoC in the references.
         http:
           - method: GET
-            path:
-              - "{{{{BaseURL}}}}/TODO_vulnerable_path"
-            matchers-condition: and
+            path: ["{{{{BaseURL}}}}/TODO"]
             matchers:
               - type: word
-                words:
-                  - "TODO_response_marker"
-              - type: status
-                status:
-                  - 200
+                words: ["TODO_marker"]
         """)
 
 
+VERCHECK = {"PyPI": "pip show {p}", "npm": "npm ls {p}", "crates.io": "cargo tree -i {p}",
+            "Go": "govulncheck ./...", "Maven": "mvn dependency:tree | grep {n}",
+            "RubyGems": "bundle list | grep {p}", "Packagist": "composer show {p}"}
+
 REPRO = {
-    "PyPI": lambda p, v: (
-        "requirements.txt", f"{p}=={v or '<VULNERABLE_VERSION>'}\n",
-        "repro.py", f"# repro for {{cve}} - {p} {v}\nimport {p.replace('-', '_')}  # TODO: call the vulnerable path\nprint('TODO: trigger the vulnerability')\n",
-        "run.sh", "#!/usr/bin/env bash\nset -e\npython3 -m venv .venv && . .venv/bin/activate\npip install -r requirements.txt\npython3 repro.py\n"),
-    "npm": lambda p, v: (
-        "package.json", json.dumps({"name": "repro", "private": True, "dependencies": {p: v or "<VULNERABLE_VERSION>"}}, indent=2) + "\n",
-        "index.js", f"// repro for {{cve}} - {p} {v}\nconst lib = require('{p}'); // TODO: call the vulnerable path\nconsole.log('TODO: trigger the vulnerability');\n",
-        "run.sh", "#!/usr/bin/env bash\nset -e\nnpm install\nnode index.js\n"),
-    "crates.io": lambda p, v: (
-        "Cargo.toml", f'[package]\nname = "repro"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n{p} = "={v or "<VULNERABLE_VERSION>"}"\n',
-        "src/main.rs", f"// repro for {{cve}} - {p} {v}\nfn main() {{\n    // TODO: call the vulnerable path in {p}\n    println!(\"TODO: trigger the vulnerability\");\n}}\n",
-        "run.sh", "#!/usr/bin/env bash\nset -e\ncargo run\n"),
+    "PyPI": lambda p, v: (("requirements.txt", f"{p}=={v or '<VULN>'}\n"),
+                          ("run.sh", "#!/usr/bin/env bash\nset -e\npython3 -m venv .venv && . .venv/bin/activate\npip install -r requirements.txt\npython3 repro.py\n"),
+                          ("repro.py", f"import {p.replace('-', '_')}  # TODO: call the vulnerable path\nprint('TODO: trigger')\n")),
+    "npm": lambda p, v: (("package.json", json.dumps({"dependencies": {p: v or "<VULN>"}}, indent=2) + "\n"),
+                         ("run.sh", "#!/usr/bin/env bash\nset -e\nnpm install\nnode index.js\n"),
+                         ("index.js", f"const lib=require('{p}'); // TODO: call the vulnerable path\nconsole.log('TODO: trigger');\n")),
+    "crates.io": lambda p, v: (("Cargo.toml", f'[package]\nname="repro"\nversion="0.1.0"\nedition="2021"\n[dependencies]\n{p}="={v or "<VULN>"}"\n'),
+                               ("run.sh", "#!/usr/bin/env bash\nset -e\ncargo run\n"),
+                               ("src/main.rs", f"fn main() {{ /* TODO: call vulnerable path in {p} */ println!(\"TODO\"); }}\n")),
 }
 
 
@@ -213,107 +302,95 @@ def gen_repro(rec, outdir):
     if not rec["affected"]:
         return None
     a = rec["affected"][0]
-    eco = a["ecosystem"]
-    if eco not in REPRO:
+    if a["ecosystem"] not in REPRO:
         return None
-    parts = REPRO[eco](a["name"], a["vuln_example"])
-    reprodir = os.path.join(outdir, "repro")
-    files = {}
-    for i in range(0, len(parts), 2):
-        files[parts[i]] = parts[i + 1].replace("{cve}", rec["id"])
-    for name, content in files.items():
-        path = os.path.join(reprodir, name)
+    rd = os.path.join(outdir, "repro")
+    for name, content in REPRO[a["ecosystem"]](a["name"], a["vuln_example"]):
+        path = os.path.join(rd, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(content)
         if name.endswith(".sh"):
             os.chmod(path, 0o755)
-    return reprodir
+    return rd
 
-
-# ---------- optional AI enrichment ----------
 
 def run_ai(rec, outdir):
     if not shutil.which("claude"):
-        print("  --ai: `claude` CLI not found, skipping AI draft")
+        print("  --ai: `claude` CLI not found, skipping")
         return
-    prompt = (
-        "You are a detection engineer. Given this CVE, write (1) a concrete detection idea "
-        "with the best data source and the specific indicators to match, and (2) a minimal "
-        "proof-of-concept repro outline. Be concrete and terse. CVE data:\n\n"
-        + json.dumps(rec, indent=2)
-    )
+    prompt = ("You are a detection engineer. Given this enriched CVE, write: (1) a concrete detection "
+              "with the best data source and the exact indicators to match (derive from the CWE class and "
+              "exploit references), and (2) a minimal repro outline. Be concrete and terse.\n\n"
+              + json.dumps(rec, indent=2))
     try:
-        r = subprocess.run(["claude", "-p", "--output-format", "text"],
-                           input=prompt, capture_output=True, text=True, timeout=180)
+        r = subprocess.run(["claude", "-p", "--output-format", "text"], input=prompt,
+                           capture_output=True, text=True, timeout=180)
         if r.returncode == 0 and r.stdout.strip():
             with open(os.path.join(outdir, "ai-draft.md"), "w") as f:
-                f.write(f"# AI-drafted detection + repro for {rec['id']}\n\n{r.stdout}\n")
+                f.write(f"# AI detection + repro draft for {rec['id']}\n\n{r.stdout}\n")
             print("  --ai: wrote ai-draft.md")
         else:
-            print(f"  --ai: claude returned no output ({r.stderr.strip()[:80]})")
+            print(f"  --ai: no output ({r.stderr.strip()[:80]})")
     except Exception as e:
         print(f"  --ai: skipped ({e})")
 
 
-# ---------- main ----------
-
 def main():
-    ap = argparse.ArgumentParser(description="turn a CVE into a detection rule + repro scaffold")
-    ap.add_argument("cve", help="e.g. CVE-2021-44228")
-    ap.add_argument("--out", default="cve2detect-out", help="output directory")
-    ap.add_argument("--ai", action="store_true", help="also draft fuller artifacts via the claude CLI")
+    ap = argparse.ArgumentParser(description="triage a CVE and bootstrap detection + repro")
+    ap.add_argument("cve")
+    ap.add_argument("--out", default="cve2detect-out")
+    ap.add_argument("--ai", action="store_true", help="draft fuller artifacts via the claude CLI")
     args = ap.parse_args()
-
     cve = args.cve.upper()
     if not re.match(r"CVE-\d{4}-\d+$", cve):
         sys.exit("error: expected a CVE id like CVE-2021-44228")
 
-    print(f"fetching {cve} from OSV + NVD ...")
+    print(f"fetching + enriching {cve} (OSV, NVD, EPSS, KEV) ...")
     rec = fetch(cve)
     if not rec:
-        sys.exit(f"error: could not find {cve} in OSV or NVD")
+        sys.exit(f"error: {cve} not found in OSV or NVD")
+
+    # print the triage banner to the terminal (the headline)
+    print("\n" + triage(rec).replace("# ", "").replace("**", "").strip() + "\n")
 
     outdir = os.path.join(args.out, cve)
     os.makedirs(outdir, exist_ok=True)
-
+    with open(os.path.join(outdir, "summary.md"), "w") as f:
+        f.write(triage(rec))
+        f.write("\n\n" + rec["summary"] + "\n")
+        f.write("\n## Affected packages\n")
+        if rec["affected"]:
+            for a in rec["affected"]:
+                intro = a["introduced"] if a["introduced"] not in (None, "0") else "earliest"
+                f.write(f"- `{a['ecosystem']}:{a['name']}` introduced {intro}, fixed in {a['fixed'] or 'see advisory'}\n")
+        else:
+            f.write("- (no package-level data; likely an OS/appliance CVE)\n")
+        f.write("\n## Generated\n- sigma.yml, nuclei.yaml, version-checks.sh"
+                + (", semgrep.yml" if code_cwe(rec) else "")
+                + (", repro/" if (rec["affected"] and rec["affected"][0]["ecosystem"] in REPRO) else "") + "\n")
     with open(os.path.join(outdir, "sigma.yml"), "w") as f:
         f.write(gen_sigma(rec))
     with open(os.path.join(outdir, "nuclei.yaml"), "w") as f:
         f.write(gen_nuclei(rec))
-
+    sg = gen_semgrep(rec)
+    if sg:
+        with open(os.path.join(outdir, "semgrep.yml"), "w") as f:
+            f.write(sg)
     checks = []
     for a in rec["affected"]:
-        fn = VERCHECK.get(a["ecosystem"])
-        if fn:
-            checks.append(f"# {a['ecosystem']}: {a['name']} (introduced {a['introduced']}, fixed {a['fixed']})\n{fn(a['name'], a['vuln_example'])}")
+        t = VERCHECK.get(a["ecosystem"])
+        if t:
+            checks.append(f"# {a['ecosystem']}: {a['name']} (fixed {a['fixed'] or 'see advisory'})\n"
+                          + t.format(p=a["name"], n=a["name"].split(":")[-1]))
     if checks:
         with open(os.path.join(outdir, "version-checks.sh"), "w") as f:
-            f.write("#!/usr/bin/env bash\n# version checks for " + cve + "\n\n" + "\n\n".join(checks) + "\n")
-
-    reprodir = gen_repro(rec, outdir)
-
-    summary = [f"# {cve}\n",
-               f"**Severity:** {rec['severity']} (CVSS {rec['cvss']})  **CWE:** {', '.join(rec['cwes']) or 'n/a'}\n",
-               f"\n{rec['summary']}\n",
-               "\n## Affected packages\n"]
-    if rec["affected"]:
-        for a in rec["affected"]:
-            intro = a["introduced"] if a["introduced"] not in (None, "0") else "earliest"
-            summary.append(f"- `{a['ecosystem']}:{a['name']}` introduced {intro}, fixed in {a['fixed'] or 'see advisory'}")
-    else:
-        summary.append("- (no package-level data; likely an OS/appliance CVE - see references)")
-    summary.append("\n\n## Generated\n- `sigma.yml` - detection skeleton\n- `nuclei.yaml` - web check skeleton\n"
-                   "- `version-checks.sh` - per-ecosystem checks\n"
-                   + (f"- `repro/` - pinned vulnerable scaffold ({rec['affected'][0]['ecosystem']})\n" if reprodir else "")
-                   + "\n## References\n" + "\n".join(f"- {u}" for u in rec["references"][:10]))
-    with open(os.path.join(outdir, "summary.md"), "w") as f:
-        f.write("\n".join(summary) + "\n")
-
+            f.write("#!/usr/bin/env bash\n# " + cve + "\n\n" + "\n\n".join(checks) + "\n")
+    gen_repro(rec, outdir)
     if args.ai:
         run_ai(rec, outdir)
 
-    print(f"\nwrote artifacts to {outdir}/")
+    print(f"wrote artifacts to {outdir}/")
     for n in sorted(os.listdir(outdir)):
         print(f"  {n}")
 

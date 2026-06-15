@@ -1,8 +1,16 @@
 # cve2detect
 
-Turn a CVE into a head start on detection and reproduction. Give it a CVE id; it pulls
-the structured advisory (OSV + NVD) and writes detection-rule skeletons and a repro
-scaffold, all seeded with the real affected packages and versions.
+Triage a CVE and bootstrap detection + reproduction. Give it a CVE id; it pulls the
+advisory from OSV + NVD and enriches it with the data a defender actually triages on,
+then writes artifacts seeded with that data.
+
+**Triage first (the headline):**
+- **KEV** - is it on CISA's Known Exploited Vulnerabilities list (exploited in the wild)?
+- **EPSS** - FIRST's probability it will be exploited in the next 30 days, with percentile.
+- **public exploit?** - derived from NVD reference tags and known exploit hosts.
+- **CVSS / CWE** - severity and vulnerability class.
+
+So before you write a line of detection, you know whether you even need to.
 
 ```
 python3 cve2detect.py CVE-2021-44228
@@ -18,7 +26,9 @@ Into `cve2detect-out/<CVE>/`:
   project (npm/pip/cargo/go/maven/...), with the fixed version noted.
 - **`repro/`** - a minimal scaffold pinned to a vulnerable version (npm / PyPI / crates.io),
   with a `run.sh` and a TODO trigger.
-- **`summary.md`** - severity, CWE, affected packages, and references in one place.
+- **`semgrep.yml`** - for code-level CWEs (SQLi, XSS, RCE, deserialization, path traversal,
+  SSRF, ...), a language-specific Semgrep rule with the CWE-class "what to look for" baked in.
+- **`summary.md`** - the full triage (KEV/EPSS/exploit/CVSS/CWE) plus affected packages and references.
 
 ## How it resolves package data
 OSV's CVE-level record usually only has git-commit ranges, so cve2detect follows the
