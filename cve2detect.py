@@ -26,6 +26,8 @@ Then it writes artifacts seeded with that real data:
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 import re
@@ -33,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.parse
 import urllib.request
 
@@ -76,12 +79,59 @@ def get_json(url, timeout=20):
         return None
 
 
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "cve2detect")
+
+
+def cached_text(url, name, ttl=86400):
+    """Download a big shared dataset once and reuse it for a day (it's the same for every CVE)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, name)
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl:
+        return open(path, encoding="utf-8", errors="ignore").read()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90) as r:
+            data = r.read().decode("utf-8", "ignore")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+        return data
+    except Exception:
+        return open(path, encoding="utf-8", errors="ignore").read() if os.path.exists(path) else ""
+
+
+def metasploit_modules(cve):
+    """Which Metasploit modules reference this CVE (authoritative: rapid7's module metadata)."""
+    text = cached_text("https://raw.githubusercontent.com/rapid7/metasploit-framework/master/db/modules_metadata_base.json", "msf.json")
+    try:
+        d = json.loads(text) if text else {}
+    except Exception:
+        return []
+    out = []
+    for mod, v in d.items():
+        for r in v.get("references", []):
+            if cve in str(r) or str(r) == cve[4:]:  # "CVE-2021-44228" or bare "2021-44228"
+                out.append(v.get("fullname", mod))
+                break
+    return sorted(set(out))
+
+
+def exploitdb_ids(cve):
+    """Which Exploit-DB entries map to this CVE (from the exploitdb files_exploits.csv 'codes' column)."""
+    text = cached_text("https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv", "edb.csv")
+    if not text:
+        return []
+    ids = []
+    for row in csv.DictReader(io.StringIO(text)):
+        if cve in (row.get("codes") or ""):
+            ids.append("EDB-" + (row.get("id") or "?"))
+    return ids
+
+
 # ---------- fetch + enrich ----------
 
 def fetch(cve):
     rec = {"id": cve, "summary": "", "cvss": None, "severity": "unknown", "cwes": [],
            "affected": [], "references": [], "exploit_refs": [],
-           "kev": None, "epss": None}
+           "kev": None, "epss": None, "msf_modules": [], "edb_ids": []}
 
     # OSV: package data (follow GHSA/etc. aliases; CVE record only has git ranges)
     osv = get_json(f"https://api.osv.dev/v1/vulns/{cve}")
@@ -159,15 +209,20 @@ def fetch(cve):
         d = epss["data"][0]
         rec["epss"] = {"score": float(d["epss"]), "percentile": float(d["percentile"])}
 
+    if osv or nvd:
+        rec["msf_modules"] = metasploit_modules(cve)
+        rec["edb_ids"] = exploitdb_ids(cve)
     return rec if (osv or nvd) else None
 
 
 def exploited_status(rec):
     if rec["kev"]:
         return "ACTIVELY EXPLOITED (on CISA KEV)"
+    if rec.get("msf_modules") or rec.get("edb_ids"):
+        return "public exploit available (Metasploit / Exploit-DB)"
     if rec["exploit_refs"]:
         return "public exploit referenced"
-    return "no public exploit found in references"
+    return "no public exploit found"
 
 
 def fetch_nuclei_template(cve):
@@ -200,6 +255,10 @@ def triage(rec):
             lines.append(f"    - required action: {rec['kev']['action']}")
     if rec.get("nuclei_template"):
         lines.append(f"- **Nuclei check:** real community template available ({rec['nuclei_template']})")
+    if rec.get("msf_modules"):
+        lines.append(f"- **Metasploit:** {len(rec['msf_modules'])} module(s), e.g. {rec['msf_modules'][0]}")
+    if rec.get("edb_ids"):
+        lines.append(f"- **Exploit-DB:** {', '.join(rec['edb_ids'][:4])}")
     if rec["cwes"]:
         labels = [f"{c} ({CWE_HINTS[c][0]})" if c in CWE_HINTS else c for c in rec["cwes"]]
         lines.append(f"- **Class:** {', '.join(labels)}")
@@ -362,7 +421,7 @@ def main():
     if not re.match(r"CVE-\d{4}-\d+$", cve):
         sys.exit("error: expected a CVE id like CVE-2021-44228")
 
-    print(f"fetching + enriching {cve} (OSV, NVD, EPSS, KEV, nuclei-templates) ...")
+    print(f"fetching + enriching {cve} (OSV, NVD, EPSS, KEV, nuclei-templates, Metasploit, Exploit-DB; first run caches ~20MB) ...")
     rec = fetch(cve)
     if not rec:
         sys.exit(f"error: {cve} not found in OSV or NVD")

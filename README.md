@@ -7,7 +7,9 @@ then writes artifacts seeded with that data.
 **Triage first (the headline):**
 - **KEV** - is it on CISA's Known Exploited Vulnerabilities list (exploited in the wild)?
 - **EPSS** - FIRST's probability it will be exploited in the next 30 days, with percentile.
-- **public exploit?** - derived from NVD reference tags and known exploit hosts.
+- **public exploit?** - concrete sources: **Metasploit** modules (rapid7's module metadata),
+  **Exploit-DB** entries (the exploitdb `codes` map), a real **Nuclei** template, and NVD
+  exploit-tagged references.
 - **CVSS / CWE** - severity and vulnerability class.
 
 So before you write a line of detection, you know whether you even need to.
